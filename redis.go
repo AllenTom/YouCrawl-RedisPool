@@ -7,6 +7,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/rs/xid"
 	"github.com/sirupsen/logrus"
+	"time"
 )
 
 var ctx = context.Background()
@@ -25,6 +26,7 @@ type RedisPool struct {
 const (
 	redisUnRequestedKey = "unrequested"
 	redisUnCompletedKey = "uncompleted"
+	redisTotalCountKey  = "total"
 )
 
 func NewRedisTaskPool(e *youcrawl.Engine, serializer RedisItemSerializer) *RedisPool {
@@ -37,6 +39,19 @@ func NewRedisTaskPool(e *youcrawl.Engine, serializer RedisItemSerializer) *Redis
 		DoneChan:       make(chan struct{}),
 	}
 }
+
+func (p *RedisPool) GetTotal() (int, error) {
+	return p.db.Get(ctx, redisTotalCountKey).Int()
+}
+
+func (p *RedisPool) GetUnRequestCount() (int, error) {
+	return int(p.db.LLen(ctx, redisUnRequestedKey).Val()), nil
+}
+
+func (p *RedisPool) GetCompleteCount() (int, error) {
+	return int(p.db.LLen(ctx, redisUnCompletedKey).Val()), nil
+}
+
 func (p *RedisPool) InitRedis(redisOption *redis.Options) error {
 	p.db = redis.NewClient(redisOption)
 	pong, err := p.db.Ping(ctx).Result()
@@ -45,6 +60,18 @@ func (p *RedisPool) InitRedis(redisOption *redis.Options) error {
 	}
 	LogField.Info(fmt.Sprintf("Ping for redis database, result = %s", pong))
 	return nil
+}
+
+func (p *RedisPool) addTotal(delta int) error {
+	var err error
+	total := 0
+	if p.db.Exists(ctx, redisTotalCountKey).Val() != 0 {
+		total, err = p.GetTotal()
+	}
+	if err != nil {
+		return err
+	}
+	return p.db.Set(ctx, redisTotalCountKey, total+delta, time.Duration(0)).Err()
 }
 func (p *RedisPool) AddURLs(urls ...string) {
 	LogField.Info(fmt.Sprintf("append new url with len = %d", len(urls)))
@@ -74,6 +101,10 @@ func (p *RedisPool) AddURLs(urls ...string) {
 			panic(err)
 		}
 
+	}
+	err := p.addTotal(len(urls))
+	if err != nil {
+		panic(err)
 	}
 
 	// suspend task requirement exist,resume
@@ -127,7 +158,10 @@ func (p *RedisPool) AddTasks(tasks ...*youcrawl.Task) {
 			panic(err)
 		}
 	}
-
+	err := p.addTotal(len(tasks))
+	if err != nil {
+		panic(err)
+	}
 	if p.GetTaskChan != nil && p.CloseFlag == 0 {
 		resumeTask := p.GetUnRequestedTask()
 		if resumeTask != nil {
